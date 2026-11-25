@@ -73,6 +73,10 @@ if len(alignment) < 3:
     st.warning("Please provide at least 3 aligned FASTA sequences.")
     st.stop()
 
+if not {"sequence_id", "collection_date"}.issubset(df_meta.columns):
+    st.error("CSV metadata must contain 'sequence_id' and 'collection_date' columns.")
+    st.stop()
+
 dates_dict = dict(
     zip(
         df_meta["sequence_id"].astype(str).str.strip(),
@@ -98,40 +102,48 @@ dist_matrix = DistanceMatrix(names=[r.id for r in alignment], matrix=lower_tri)
 # STEP 2: NEIGHBOR-JOINING TREE & MOLECULAR CLOCK REGRESSION
 # =====================================================================
 tree = DistanceTreeConstructor().nj(dist_matrix)
-tree.root_at_midpoint()
 
-distances, times = [], []
+valid_dates = {}
 for leaf in tree.get_terminals():
     date_str = dates_dict.get(leaf.name)
     if date_str:
         try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            times.append(dt.year + (dt.timetuple().tm_yday - 1) / 365.25)
-            distances.append(tree.distance(tree.root, leaf))
+            valid_dates[leaf.name] = datetime.strptime(date_str, "%Y-%m-%d")
         except ValueError:
             st.error(f"Invalid date format for '{leaf.name}': '{date_str}'. Use YYYY-MM-DD.")
             st.stop()
 
-times, distances = np.array(times), np.array(distances)
-
-if len(times) < 2:
+if len(valid_dates) < 2:
     st.error("At least 2 sequence IDs must match between the FASTA headers and CSV metadata.")
     st.stop()
 
+# Root tree at the earliest sampled strain (ancestral outgroup)
+earliest_strain = min(valid_dates, key=valid_dates.get)
+tree.root_with_outgroup(earliest_strain)
+
+distances, times = [], []
+for leaf in tree.get_terminals():
+    if leaf.name in valid_dates:
+        dt = valid_dates[leaf.name]
+        times.append(dt.year + (dt.timetuple().tm_yday - 1) / 365.25)
+        distances.append(tree.distance(tree.root, leaf))
+
+times, distances = np.array(times), np.array(distances)
 slope, intercept, r_val, _, _ = stats.linregress(times, distances)
 t_mrca = -intercept / slope if slope != 0 else 0.0
 
 # =====================================================================
 # STEP 3: STOCHASTIC SIR SIMULATION (GILLESPIE ALGORITHM)
 # =====================================================================
-S, I, R, t = N - 1, 1, 0, 0.0
+I0 = min(5, N - 1)
+S, I, R, t = N - I0, I0, 0, 0.0
 sim_t, S_list, I_list, R_list = [0.0], [S], [I], [R]
 np.random.seed(42)
 
 while t < t_max and I > 0:
     r_inf, r_rec = beta * S * I / N, gamma * I
     r_tot = r_inf + r_rec
-    if r_tot == 0:
+    if r_tot <= 0:
         break
     t += np.random.exponential(1.0 / r_tot)
     if np.random.rand() < (r_inf / r_tot):
@@ -143,6 +155,14 @@ while t < t_max and I > 0:
     I_list.append(I)
     R_list.append(R)
 
+# Downsample trajectory points if N is huge to keep Matplotlib fast & clean
+if len(sim_t) > 3000:
+    step = len(sim_t) // 3000
+    sim_t = sim_t[::step] + [sim_t[-1]]
+    S_list = S_list[::step] + [S_list[-1]]
+    I_list = I_list[::step] + [I_list[-1]]
+    R_list = R_list[::step] + [R_list[-1]]
+
 # =====================================================================
 # STEP 4: DISPLAY METRICS & VISUALIZATIONS
 # =====================================================================
@@ -153,7 +173,7 @@ c2.metric("Estimated tMRCA", f"{t_mrca:.2f}")
 c3.metric("Clock Fit (R²)", f"{r_val**2:.4f}")
 c4.metric("Peak Infected", f"{max(I_list):,}")
 
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), layout="constrained")
 
 # Plot 1: Molecular Clock Regression
 axes[0].scatter(times, distances, color="dodgerblue", label="Viral Samples", zorder=3)
@@ -166,7 +186,13 @@ axes[0].grid(True, linestyle=":", alpha=0.6)
 axes[1].plot(sim_t, S_list, label="Susceptible S(t)", color="blue", alpha=0.75)
 axes[1].plot(sim_t, I_list, label="Infected I(t)", color="crimson", lw=2.2)
 axes[1].plot(sim_t, R_list, label="Recovered R(t)", color="green", alpha=0.75)
-axes[1].set(title=f"Stochastic SIR Trajectory ($R_0$ = {beta/gamma:.2f})", xlabel="Time (Days)", ylabel="Population")
+axes[1].set(
+    title=f"Stochastic SIR Trajectory ($R_0$ = {beta/gamma:.2f})",
+    xlabel="Time (Days)",
+    ylabel="Population",
+    xlim=(0, t_max),
+    ylim=(0, N * 1.05),
+)
 axes[1].legend()
 axes[1].grid(True, linestyle=":", alpha=0.6)
 
@@ -174,6 +200,5 @@ axes[1].grid(True, linestyle=":", alpha=0.6)
 Phylo.draw(tree, axes=axes[2], do_show=False)
 axes[2].set_title("Phylogenetic Tree (NJ)")
 
-plt.tight_layout()
 st.pyplot(fig)
 plt.close(fig)
